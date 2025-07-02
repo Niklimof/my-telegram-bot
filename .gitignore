@@ -9,7 +9,11 @@ venv/
 .venv/
 env/
 .env
+
+# Папки которые не нужны в Git
 youtube_automation_bot/venv/
+youtube_automation_bot/redis-stable/
+redis-stable/
 
 # Базы данных
 *.db
