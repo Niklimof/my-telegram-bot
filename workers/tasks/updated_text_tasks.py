@@ -1,9 +1,11 @@
-# workers/tasks/text_tasks.py
-# Celery задачи с двойной обработкой Claude
+# workers/tasks/updated_text_tasks.py
+# Обновленные Celery задачи с двойной обработкой Claude
 
 from celery import shared_task
+from core.pipeline.updated_text_pipeline import UpdatedTextPipeline
 from database.crud import update_project, add_log, get_project, get_plan
-from config.settings import settings
+from config.secure_settings import settings
+from interfaces.telegram_bot.improved_bot import notify_progress
 import asyncio
 import logging
 from datetime import datetime
@@ -15,9 +17,6 @@ def process_text_pipeline(self, project_id: str):
     """Запускает pipeline обработки текста с двойной обработкой Claude"""
     
     try:
-        # Импортируем здесь чтобы избежать циклических импортов
-        from core.pipeline.updated_text_pipeline import UpdatedTextPipeline
-        
         # Получаем данные проекта
         project = get_project(project_id)
         if not project:
@@ -34,9 +33,13 @@ def process_text_pipeline(self, project_id: str):
             "started_at": datetime.now()
         })
         
+        # Проверяем конфигурацию
+        if not settings.is_fully_configured():
+            raise ValueError("Не все API ключи настроены. Проверьте .env файл")
+        
         # Создаем pipeline
         config = {
-            "whisper_model": project.settings.whisper_model if project.settings else "large",
+            "whisper_model": project.settings.whisper_model,
             "claude_api_key": settings.CLAUDE_API_KEY,
             "speechkit_api_key": settings.YANDEX_SPEECHKIT_API_KEY,
             "speechkit_folder_id": settings.YANDEX_SPEECHKIT_FOLDER_ID,
@@ -51,16 +54,7 @@ def process_text_pipeline(self, project_id: str):
             
             # Отправляем уведомление в Telegram
             if project.telegram_chat_id:
-                try:
-                    # Динамический импорт для избежания циклических зависимостей
-                    from interfaces.telegram_bot.bot import bot
-                    await bot.send_message(
-                        project.telegram_chat_id,
-                        f"📊 Проект `{project_id[:8]}...`\n{message}",
-                        parse_mode="Markdown"
-                    )
-                except Exception as e:
-                    logger.error(f"Ошибка отправки уведомления: {e}")
+                await notify_progress(project.telegram_chat_id, project_id, message)
         
         callbacks = {
             "download_start": update_progress,
@@ -83,23 +77,11 @@ def process_text_pipeline(self, project_id: str):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-        # Преобразуем план в словарь
-        plan_dict = {
-            "name": plan.name,
-            "description": plan.description,
-            "text_steps": plan.text_steps,
-            "video_steps": plan.video_steps,
-            "default_prompt": plan.default_prompt,
-            "default_voice": plan.default_voice,
-            "modules_enabled": plan.modules_enabled,
-            "metadata": plan.metadata if hasattr(plan, 'metadata') else {}
-        }
-        
         results = loop.run_until_complete(
             pipeline.process(
                 project_id=project_id,
                 youtube_url=project.youtube_url,
-                plan=plan_dict,
+                plan=plan.__dict__,
                 callbacks=callbacks
             )
         )
@@ -126,20 +108,16 @@ def process_text_pipeline(self, project_id: str):
         
         # Отправляем финальное уведомление
         if project.telegram_chat_id:
-            try:
-                from interfaces.telegram_bot.bot import bot
-                loop.run_until_complete(
-                    bot.send_message(
-                        project.telegram_chat_id,
-                        f"🎉 Ваш рассказ готов!\n"
-                        f"📁 Скачать: {results['yandex_folder_url']}\n"
-                        f"⏱ Длительность: ~{results['steps']['speech_generation']['total_duration']/60:.1f} минут\n"
-                        f"📝 Слов: {results['steps']['text_processing']['word_count']}",
-                        parse_mode="Markdown"
-                    )
+            loop.run_until_complete(
+                notify_progress(
+                    project.telegram_chat_id, 
+                    project_id,
+                    f"🎉 Ваш рассказ готов!\n"
+                    f"📁 Скачать: {results['yandex_folder_url']}\n"
+                    f"⏱ Длительность: ~{results['steps']['speech_generation']['total_duration']/60:.1f} минут\n"
+                    f"📝 Слов: {results['steps']['text_processing']['word_count']}"
                 )
-            except Exception as e:
-                logger.error(f"Ошибка отправки финального уведомления: {e}")
+            )
         
         return results
         
@@ -158,15 +136,14 @@ def process_text_pipeline(self, project_id: str):
         try:
             project = get_project(project_id)
             if project and project.telegram_chat_id:
-                from interfaces.telegram_bot.bot import bot
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 loop.run_until_complete(
-                    bot.send_message(
+                    notify_progress(
                         project.telegram_chat_id,
-                        f"❌ Произошла ошибка при обработке проекта `{project_id[:8]}...`\n"
-                        f"Попробуем еще раз через 5 минут.",
-                        parse_mode="Markdown"
+                        project_id,
+                        f"❌ Произошла ошибка при обработке.\n"
+                        f"Попробуем еще раз через 5 минут."
                     )
                 )
         except:
@@ -174,3 +151,73 @@ def process_text_pipeline(self, project_id: str):
         
         # Повторная попытка
         raise self.retry(exc=e, countdown=300)  # Повтор через 5 минут
+
+@shared_task
+def cleanup_old_files(days_to_keep: int = 7):
+    """Очищает старые файлы проектов"""
+    import os
+    import shutil
+    from datetime import datetime, timedelta
+    
+    cutoff_date = datetime.now() - timedelta(days=days_to_keep)
+    
+    # Очищаем папку downloads
+    downloads_dir = settings.DOWNLOAD_DIR
+    if os.path.exists(downloads_dir):
+        for folder in os.listdir(downloads_dir):
+            folder_path = os.path.join(downloads_dir, folder)
+            if os.path.isdir(folder_path):
+                # Проверяем дату создания
+                folder_time = datetime.fromtimestamp(os.path.getctime(folder_path))
+                if folder_time < cutoff_date:
+                    logger.info(f"Удаляем старую папку: {folder_path}")
+                    shutil.rmtree(folder_path)
+    
+    # Очищаем папку outputs
+    outputs_dir = settings.OUTPUT_DIR
+    if os.path.exists(outputs_dir):
+        for folder in os.listdir(outputs_dir):
+            folder_path = os.path.join(outputs_dir, folder)
+            if os.path.isdir(folder_path):
+                folder_time = datetime.fromtimestamp(os.path.getctime(folder_path))
+                if folder_time < cutoff_date:
+                    logger.info(f"Удаляем старую папку: {folder_path}")
+                    shutil.rmtree(folder_path)
+    
+    logger.info("Очистка старых файлов завершена")
+
+@shared_task
+def check_project_status(project_id: str):
+    """Проверяет статус проекта и отправляет уведомление"""
+    project = get_project(project_id)
+    
+    if not project:
+        logger.error(f"Проект {project_id} не найден")
+        return
+    
+    if project.status == "processing":
+        # Проверяем, не завис ли проект
+        if project.started_at:
+            processing_time = (datetime.now() - project.started_at).total_seconds() / 60
+            
+            if processing_time > 120:  # Более 2 часов
+                logger.warning(f"Проект {project_id} обрабатывается более 2 часов")
+                
+                # Отправляем предупреждение
+                if project.telegram_chat_id:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(
+                        notify_progress(
+                            project.telegram_chat_id,
+                            project_id,
+                            "⚠️ Обработка занимает больше времени чем обычно.\n"
+                            "Проверяем статус..."
+                        )
+                    )
+    
+    return {
+        "project_id": project_id,
+        "status": project.status,
+        "processing_time": (datetime.now() - project.started_at).total_seconds() / 60 if project.started_at else 0
+    }

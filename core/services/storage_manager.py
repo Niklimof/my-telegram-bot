@@ -1,12 +1,12 @@
-# Путь: /youtube_automation_bot/core/services/storage_manager.py
-# Описание: Менеджер для работы с Яндекс.Диском
+# core/services/storage_manager.py
+# Менеджер для работы с Яндекс.Диском
 
 import yadisk
 import os
-import json
-from typing import Dict, Any, List
-from datetime import datetime
+import asyncio
+from typing import Dict, List, Any
 import logging
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -14,84 +14,130 @@ class YandexDiskManager:
     """Управление файлами на Яндекс.Диске"""
     
     def __init__(self, token: str):
-        self.y = yadisk.YaDisk(token=token)
-        
-        # Проверка токена
-        if not self.y.check_token():
-            raise ValueError("Invalid Yandex.Disk token")
-        
-        self.base_path = "/VideoAutomation"
+        self.client = yadisk.YaDisk(token=token)
+        self.base_folder = "/VideoAutomation"
         
     async def upload_project(self, 
                            project_id: str,
-                           files: Dict[str, List[str]],
+                           folder_structure: Dict[str, List[str]],
                            metadata: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Загружает файлы проекта на Яндекс.Диск
+        Загружает проект на Яндекс.Диск
         
         Args:
             project_id: ID проекта
-            files: Словарь {категория: [пути к файлам]}
+            folder_structure: Структура папок и файлов
             metadata: Метаданные проекта
             
         Returns:
             Информация о загрузке
         """
-        # Создаем структуру папок
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        project_path = f"{self.base_path}/{date_str}/{project_id}"
-        
-        # Создаем базовые папки
-        self._ensure_folder(self.base_path)
-        self._ensure_folder(f"{self.base_path}/{date_str}")
-        self._ensure_folder(project_path)
-        
-        uploaded_files = []
-        
-        # Загружаем файлы по категориям
-        for category, file_list in files.items():
-            category_path = f"{project_path}/{category}"
-            self._ensure_folder(category_path)
-            
-            for file_path in file_list:
-                if os.path.exists(file_path):
-                    remote_path = f"{category_path}/{os.path.basename(file_path)}"
-                    
-                    logger.info(f"Загружаем {file_path} -> {remote_path}")
-                    
-                    try:
-                        self.y.upload(file_path, remote_path, overwrite=True)
-                        uploaded_files.append(remote_path)
-                    except Exception as e:
-                        logger.error(f"Ошибка загрузки {file_path}: {e}")
-        
-        # Сохраняем метаданные
-        metadata_path = f"{project_path}/metadata.json"
-        metadata_local = f"/tmp/{project_id}_metadata.json"
-        
-        with open(metadata_local, 'w', encoding='utf-8') as f:
-            json.dump(metadata, f, ensure_ascii=False, indent=2)
-        
-        self.y.upload(metadata_local, metadata_path, overwrite=True)
-        os.remove(metadata_local)
-        
-        # Получаем публичную ссылку на папку
-        self.y.publish(project_path)
-        meta = self.y.get_meta(project_path)
-        
-        return {
-            "folder_path": project_path,
-            "folder_url": meta.public_url,
-            "files_count": len(uploaded_files),
-            "uploaded_files": uploaded_files
-        }
-    
-    def _ensure_folder(self, path: str):
-        """Создает папку если она не существует"""
         try:
-            self.y.mkdir(path)
-        except yadisk.exceptions.PathExistsError:
-            pass  # Папка уже существует
+            # Проверяем токен
+            if not self.client.check_token():
+                raise ValueError("Недействительный токен Яндекс.Диска")
+            
+            # Создаем папку проекта
+            project_folder = f"{self.base_folder}/Projects/{project_id}"
+            
+            # Создаем базовую структуру
+            await self._ensure_folder_exists(self.base_folder)
+            await self._ensure_folder_exists(f"{self.base_folder}/Projects")
+            await self._ensure_folder_exists(project_folder)
+            
+            # Загружаем файлы по категориям
+            uploaded_files = []
+            
+            for category, files in folder_structure.items():
+                category_folder = f"{project_folder}/{category}"
+                await self._ensure_folder_exists(category_folder)
+                
+                for file_path in files:
+                    if os.path.exists(file_path):
+                        file_name = os.path.basename(file_path)
+                        remote_path = f"{category_folder}/{file_name}"
+                        
+                        logger.info(f"Загружаем {file_name} в {category_folder}")
+                        
+                        await self._upload_file(file_path, remote_path)
+                        uploaded_files.append(remote_path)
+            
+            # Создаем файл с метаданными
+            import json
+            metadata_path = f"outputs/{project_id}/project_metadata.json"
+            os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+            
+            with open(metadata_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    **metadata,
+                    "upload_date": datetime.now().isoformat(),
+                    "files_count": len(uploaded_files)
+                }, f, ensure_ascii=False, indent=2)
+            
+            await self._upload_file(metadata_path, f"{project_folder}/metadata.json")
+            
+            # Получаем публичную ссылку
+            folder_url = await self._get_public_url(project_folder)
+            
+            logger.info(f"Проект {project_id} успешно загружен")
+            
+            return {
+                "folder_url": folder_url,
+                "folder_path": project_folder,
+                "files_count": len(uploaded_files),
+                "uploaded_files": uploaded_files
+            }
+            
         except Exception as e:
-            logger.error(f"Ошибка создания папки {path}: {e}")
+            logger.error(f"Ошибка при загрузке на Яндекс.Диск: {e}")
             raise
+    
+    async def _ensure_folder_exists(self, folder_path: str):
+        """Создает папку если не существует"""
+        loop = asyncio.get_event_loop()
+        
+        def check_and_create():
+            try:
+                if not self.client.exists(folder_path):
+                    self.client.mkdir(folder_path)
+                    logger.info(f"Создана папка: {folder_path}")
+            except Exception as e:
+                # Папка может уже существовать
+                logger.debug(f"Папка {folder_path} уже существует или ошибка: {e}")
+        
+        await loop.run_in_executor(None, check_and_create)
+    
+    async def _upload_file(self, local_path: str, remote_path: str):
+        """Загружает файл"""
+        loop = asyncio.get_event_loop()
+        
+        def upload():
+            try:
+                self.client.upload(local_path, remote_path, overwrite=True)
+            except Exception as e:
+                logger.error(f"Ошибка загрузки файла {local_path}: {e}")
+                raise
+        
+        await loop.run_in_executor(None, upload)
+    
+    async def _get_public_url(self, folder_path: str) -> str:
+        """Получает публичную ссылку на папку"""
+        loop = asyncio.get_event_loop()
+        
+        def get_url():
+            try:
+                # Публикуем папку
+                self.client.publish(folder_path)
+                
+                # Получаем мета-информацию
+                meta = self.client.get_meta(folder_path)
+                
+                # Возвращаем публичную ссылку
+                return meta.public_url or folder_path
+                
+            except Exception as e:
+                logger.error(f"Ошибка получения публичной ссылки: {e}")
+                # Возвращаем путь если не удалось получить ссылку
+                return folder_path
+        
+        return await loop.run_in_executor(None, get_url)
